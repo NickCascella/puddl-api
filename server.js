@@ -11,6 +11,17 @@ const con = require("./mysql");
 app.use(cors());
 app.use(express.json());
 
+function doQuery(sql, params) {
+  return new Promise((resolve, reject) => {
+    con.query(sql, params, (err, result, fields) => {
+      if (err) reject();
+      else {
+        resolve({ result, fields });
+      }
+    });
+  });
+}
+
 //SOCKET STUFF
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -23,19 +34,52 @@ io.on("connection", (socket) => {
   socket.on("online", (data) => {
     con.query(
       `SELECT chatrooms.chatroom_name FROM users INNER JOIN users_chatrooms ON users.user_id = users_chatrooms.user_id INNER JOIN chatrooms ON users_chatrooms.chatroom_id = chatrooms.chatroom_id WHERE users.username = '${data.username}'`,
-      (err, existingUsers) => {
+      (err, userData) => {
         if (err) {
           console.log(err);
           return;
         }
 
-        if (existingUsers.length) {
-          existingUsers.forEach(async (chat) => {
-            await socket.join(chat.chat_name);
+        if (userData.length) {
+          let getData = async () => {
+            return Promise.all(
+              userData.map(async (chat) => {
+                let allChatUsers = await doQuery(
+                  `SELECT users.username FROM users INNER JOIN users_chatrooms ON users.user_id = users_chatrooms.user_id INNER JOIN chatrooms ON users_chatrooms.chatroom_id = chatrooms.chatroom_id WHERE chatrooms.chatroom_name = '${chat.chatroom_name}'`
+                );
+
+                let roomUsers = allChatUsers.result.map((user) => {
+                  return { username: user.username, online: false };
+                });
+                await socket.join(chat.chatroom_name);
+                return {
+                  joinedRoom: chat.chatroom_name,
+                  chatUsers: roomUsers,
+                };
+                // con.query(
+                //   `SELECT users.username FROM users INNER JOIN users_chatrooms ON users.user_id = users_chatrooms.user_id INNER JOIN chatrooms ON users_chatrooms.chatroom_id = chatrooms.chatroom_id WHERE chatrooms.chatroom_name = '${chat.chatroom_name}'`,
+                //   (err, allChatUsers) => {
+                //     if (err) {
+                //       console.log(err);
+                //       return;
+                //     }
+                //     let roomUsers = allChatUsers.map((user) => {
+                //       return { username: user.username, online: false };
+                //     });
+
+                //     socket.emit("fetch-user-chat", {
+                //       joinedRoom: chat.chatroom_name,
+                //       chatUsers: roomUsers,
+                //     });
+                //   }
+                // );
+              })
+            );
+          };
+          getData().then((a) => {
+            socket.emit("fetch-user-chat", a);
           });
         }
-
-        // socket.emit("retrieve-chatlogs", {});
       }
     );
 
