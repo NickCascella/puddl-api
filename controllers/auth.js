@@ -109,7 +109,9 @@ module.exports.authLogin = [
 
               if (result) {
                 let token = jwt.sign(
-                  { user: existingUsers[0].username },
+                  {
+                    user: existingUsers[0].username,
+                  },
                   process.env.SECRET,
                   {
                     expiresIn: "1hr",
