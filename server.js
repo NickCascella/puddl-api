@@ -6,7 +6,6 @@ const authRoutes = require("./routes/auth");
 const app = express();
 const verifyToken = require("./utils/authenticate");
 const { Server } = require("socket.io");
-const con = require("./mysql");
 const doQuery = require("./utils/query");
 
 app.use(cors());
@@ -46,8 +45,9 @@ io.on("connection", (socket) => {
                 };
               });
               await socket.join(chat.chatroom_name);
-              io.emit("other-user-online", {
+              io.emit("other-user-status", {
                 username: data.username,
+                online: true,
               });
               return {
                 joinedRoom: chat.chatroom_name,
@@ -60,6 +60,25 @@ io.on("connection", (socket) => {
         const userRoomInfo = await getData();
 
         socket.emit("fetch-user-chat", userRoomInfo);
+      }
+    } catch (err) {
+      console.log(err);
+    }
+  });
+
+  socket.on("get-old-notifications", async (data) => {
+    try {
+      const selected = await doQuery(
+        `SELECT notifications.notifications, chatrooms.chatroom_name FROM notifications INNER JOIN users ON users.user_id = notifications.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = notifications.chatroom_id WHERE username = '${data.username}' AND notifications > 0`
+      );
+      if (selected.result.length) {
+        let oldNotifications = {};
+        for (const notification of selected.result) {
+          oldNotifications[notification.chatroom_name] =
+            notification.notifications;
+        }
+
+        socket.emit("retrieved-prior-notifications", oldNotifications);
       }
     } catch (err) {
       console.log(err);
@@ -81,37 +100,9 @@ io.on("connection", (socket) => {
         io.to(data.chatroom).emit("joined-room", {
           joinedRoom: data.chatroom,
           chatUsers: usernames,
-        });
-
-        io.to(data.chatroom).emit("display-message", {
-          message: `${data.username} has joined!`,
-          username: "Puddl",
-          chatroom: data.chatroom,
-          timestamp: data.timestamp,
+          username: data.username,
         });
       };
-
-      socket.on("retrieve-prior-messages", async (data) => {
-        const getChatMessages = async (chatroom) => {
-          try {
-            const messages = await doQuery(
-              `SELECT message, timestamp, chatroom_name as chatroom, username FROM messages INNER JOIN chatrooms ON chatrooms.chatroom_id = messages.chatroom_id INNER JOIN users ON users.user_id = messages.user_id WHERE chatroom_name = '${chatroom}' `
-            );
-            return messages.result;
-          } catch (err) {
-            console.log(err);
-          }
-        };
-
-        const allMessages = await Promise.all(
-          data.chatrooms.map((elem) => getChatMessages(elem))
-        );
-        const mergedAllMessages = [].concat.apply([], allMessages);
-
-        socket.emit("retrieved-prior-messages", {
-          allMessages: mergedAllMessages,
-        });
-      });
 
       //Check if room exists
       const chatroomDataQuery = await doQuery(
@@ -133,10 +124,18 @@ io.on("connection", (socket) => {
         joinChat(chatroomData[0].chatroom_id);
       } else {
         //Create Room and join it
+
         const createChatroomQuery = await doQuery(
           `INSERT INTO chatrooms (chatroom_name) VALUES ('${data.chatroom}')`
         );
         const createChatroom = createChatroomQuery.result;
+
+        //Add Puddl account to new chatroom
+        const joinChatQuery = await doQuery(
+          `INSERT INTO users_chatrooms (chatroom_id, user_id) SELECT '${createChatroom.insertId}', user_id FROM users WHERE username = 'Puddl'`
+        );
+
+        //Add user to new chatroom
         joinChat(createChatroom.insertId);
       }
     } catch (err) {
@@ -144,9 +143,44 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("retrieve-prior-messages", async (data) => {
+    const getChatMessages = async (chatroom) => {
+      try {
+        const messages = await doQuery(
+          `SELECT message, timestamp, chatroom_name as chatroom, username FROM messages INNER JOIN chatrooms ON chatrooms.chatroom_id = messages.chatroom_id INNER JOIN users ON users.user_id = messages.user_id WHERE chatroom_name = '${chatroom}' ORDER BY messages.message_id desc LIMIT 10 `
+        );
+
+        return messages.result;
+      } catch (err) {
+        console.log(err);
+      }
+    };
+
+    const allMessages = await Promise.all(
+      data.chatrooms.map((elem) => getChatMessages(elem))
+    );
+    const mergedAllMessages = [].concat.apply([], allMessages);
+
+    socket.emit("retrieved-prior-messages", {
+      allMessages: mergedAllMessages,
+    });
+  });
+
+  socket.on("fetch-additional-messages", async (data) => {
+    try {
+      const messages = await doQuery(
+        `SELECT message, timestamp, chatroom_name as chatroom, username FROM messages INNER JOIN chatrooms ON chatrooms.chatroom_id = messages.chatroom_id INNER JOIN users ON users.user_id = messages.user_id WHERE chatroom_name = '${data.chatroom}' ORDER BY messages.message_id desc LIMIT ${data.offset}, 10 `
+      );
+      console.log(messages);
+      socket.emit("fetched-additional-messages", messages.result);
+    } catch (err) {
+      console.log(err);
+    }
+  });
+
   socket.on("send-message", async (data) => {
     try {
-      const saveMessage = await doQuery(
+      await doQuery(
         `INSERT INTO messages (message, timestamp, chatroom_id, user_id) SELECT '${
           data.message
         }', '${parseInt(
@@ -156,6 +190,33 @@ io.on("connection", (socket) => {
         }' AND chatroom_name = '${data.chatroom}'`
       );
 
+      const onlineUsers = io.sockets.adapter.rooms.get(data.chatroom);
+      const roomUsersResults = await doQuery(
+        `SELECT username from users INNER JOIN users_chatrooms ON users_chatrooms.user_id = users.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = users_chatrooms.chatroom_id WHERE chatroom_name = '${data.chatroom}'`
+      );
+      const roomUsers = roomUsersResults.result.map((user) => user.username);
+      const offlineUsers = roomUsers.filter(
+        (user) => !online[user] && user !== "Puddl"
+      );
+      offlineUsers.map(async (username) => {
+        try {
+          const selected = await doQuery(
+            `SELECT notifications.notifications, chatrooms.chatroom_id, users.user_id FROM notifications INNER JOIN users ON users.user_id = notifications.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = notifications.chatroom_id WHERE username = '${username}' AND chatroom_name = '${data.chatroom}'`
+          );
+          if (selected.result.length) {
+            await doQuery(
+              `UPDATE notifications INNER JOIN users ON users.user_id = notifications.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = notifications.chatroom_id  SET notifications.notifications = notifications.notifications + 1 WHERE username = '${username}' AND chatroom_name = '${data.chatroom}'`
+            );
+          } else {
+            await doQuery(
+              `INSERT INTO notifications (notifications, chatroom_id, user_id) SELECT 1, chatrooms.chatroom_id, users.user_id FROM users INNER JOIN users_chatrooms ON users.user_id = users_chatrooms.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = users_chatrooms.chatroom_id WHERE username = '${username}' AND chatroom_name = '${data.chatroom}'`
+            );
+          }
+        } catch (err) {
+          console.log(err);
+        }
+      });
+
       io.to(data.chatroom).emit("display-message", {
         message: data.message,
         username: data.username,
@@ -164,6 +225,37 @@ io.on("connection", (socket) => {
       });
     } catch (err) {
       console.log("SEND MESSAGE ERR", err);
+    }
+  });
+
+  socket.on("log-notification", async (data) => {
+    try {
+      const selected = await doQuery(
+        `SELECT notifications.notifications, chatrooms.chatroom_id, users.user_id FROM notifications INNER JOIN users ON users.user_id = notifications.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = notifications.chatroom_id WHERE username = '${data.username}' AND chatroom_name = '${data.chatroom}'`
+      );
+      if (selected.result.length) {
+        await doQuery(
+          `UPDATE notifications INNER JOIN users ON users.user_id = notifications.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = notifications.chatroom_id  SET notifications.notifications = notifications.notifications + 1 WHERE username = '${data.username}' AND chatroom_name = '${data.chatroom}'`
+        );
+      } else {
+        await doQuery(
+          `INSERT INTO notifications (notifications, chatroom_id, user_id) SELECT 1, chatrooms.chatroom_id, users.user_id FROM users INNER JOIN users_chatrooms ON users.user_id = users_chatrooms.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = users_chatrooms.chatroom_id WHERE username = '${data.username}' AND chatroom_name = '${data.chatroom}'`
+        );
+      }
+    } catch (err) {
+      console.log(err);
+    }
+  });
+
+  socket.on("delete-notifications", async (data) => {
+    console.log(data);
+    try {
+      await doQuery(
+        `UPDATE notifications INNER JOIN users ON users.user_id = notifications.user_id INNER JOIN chatrooms ON chatrooms.chatroom_id = notifications.chatroom_id  SET notifications.notifications = 0 WHERE users.username = '${data.username}' AND chatrooms.chatroom_name = '${data.chatroom}'`
+      );
+      console.log("updated");
+    } catch (err) {
+      console.log(err);
     }
   });
 
@@ -177,12 +269,7 @@ io.on("connection", (socket) => {
         username: data.username,
         chatroom: data.chatroom,
       });
-      io.to(data.chatroom).emit("display-message", {
-        message: `${data.username} has left!`,
-        username: "Puddl",
-        chatroom: data.chatroom,
-        timestamp: data.timestamp,
-      });
+
       io.to(data.chatroom).emit("other-user-left", {
         username: data.username,
         chatroom: data.chatroom,
@@ -192,17 +279,26 @@ io.on("connection", (socket) => {
     }
   });
 
-  // socket.on("offline", () => {
-  //   online[socket.username] = false;
-  //   for (let room of socket.rooms) {
-  //     io.to(room).emit("other-user-offline", { username: socket.username });
-  //   }
-  // });
-
-  socket.on("disconnet", () => {
+  socket.on("offline", () => {
     online[socket.username] = false;
+
     for (let room of socket.rooms) {
-      io.to(room).emit("other-user-offline", { username: socket.username });
+      io.to(room).emit("other-user-status", {
+        username: socket.username,
+        online: false,
+      });
+    }
+  });
+
+  socket.on("disconnect", () => {
+    online[socket.username] = false;
+    console.log(socket.rooms);
+    for (let room of socket.rooms) {
+      console.log(room);
+      io.to(room).emit("other-user-status", {
+        username: socket.username,
+        online: false,
+      });
     }
   });
 });
